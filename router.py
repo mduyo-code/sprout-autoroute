@@ -1,7 +1,7 @@
 """
 router.py — Core logic for Sprout AutoRoute
-  1. identify_client  — matches sender email → client record from Google Sheets
-  2. route_ticket     — calls Claude API to pick the best Freshdesk scenario
+  1. identify_client  — matches sender email OR company name from Google Sheets
+  2. route_ticket     — calls Claude AI to pick the best Freshdesk scenario
   3. assign_ticket    — triggers the exact Freshdesk Scenario Automation
 """
 
@@ -126,8 +126,10 @@ AGENT_INITIALS = {
     "angeline flores":        "AF",
 }
 
+
 # ════════════════════════════════════════════════════════════════════════════
 # 1. CLIENT IDENTIFICATION  (Google Sheets)
+#    Priority: exact email → domain → company name in subject/body
 # ════════════════════════════════════════════════════════════════════════════
 
 _sheet_cache: dict = {}
@@ -148,9 +150,12 @@ def _load_sheet() -> list:
     ws = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
     all_rows = ws.get_all_values()
 
-    EMAIL_COLS = [14, 21, 22, 23, 24, 25, 26]  # O, V, W, X, Y, Z, AA
-    PIC_COL    = 33   # AH
-    NAME_COL   = 0    # A
+    # Column indices (0-based):
+    # A=0 (primary name), C=2 (alt name), O=14, V=21, W=22,
+    # X=23, Y=24, Z=25, AA=26 (emails), AE=30 (alt name 2), AH=33 (PIC)
+    EMAIL_COLS   = [14, 21, 22, 23, 24, 25, 26]  # O, V, W, X, Y, Z, AA
+    NAME_COLS    = [0, 2, 30]                      # A, C, AE
+    PIC_COL      = 33                              # AH
 
     clients: dict = {}
 
@@ -158,19 +163,32 @@ def _load_sheet() -> list:
         def get(idx):
             return row[idx].strip() if idx < len(row) else ""
 
-        company = get(NAME_COL)
-        pic     = get(PIC_COL)
-        if not pic:
+        # Collect all name variants (A, C, AE) — use column A as primary key
+        primary_name = get(0)
+        alt_names    = [get(i) for i in NAME_COLS if get(i)]
+        pic          = get(PIC_COL)
+
+        if not pic or not primary_name:
             continue
 
         emails = [get(i) for i in EMAIL_COLS if get(i)]
-        if not emails:
-            continue
 
-        if company not in clients:
-            clients[company] = {"company": company, "pic": pic, "emails": []}
-        clients[company]["emails"].extend(emails)
-        clients[company]["emails"] = list(dict.fromkeys(clients[company]["emails"]))
+        if primary_name not in clients:
+            clients[primary_name] = {
+                "company":   primary_name,
+                "alt_names": [],
+                "pic":       pic,
+                "emails":    [],
+            }
+
+        # Merge alt names and emails (handles multiple rows per company)
+        for n in alt_names:
+            if n and n not in clients[primary_name]["alt_names"]:
+                clients[primary_name]["alt_names"].append(n)
+        clients[primary_name]["emails"].extend(emails)
+        clients[primary_name]["emails"] = list(
+            dict.fromkeys(clients[primary_name]["emails"])
+        )
 
     _sheet_cache = clients
     _sheet_cache_expiry = datetime.now() + timedelta(minutes=10)
@@ -178,25 +196,68 @@ def _load_sheet() -> list:
     return list(clients.values())
 
 
-def identify_client(sender_email: str):
-    if not sender_email:
-        return None
+def _normalize(text: str) -> str:
+    """Lowercase and remove common suffixes for fuzzy company matching."""
+    text = text.lower().strip()
+    for suffix in [" inc.", " inc", " corp.", " corp", " co.", " co",
+                   " ltd.", " ltd", " llc", " phil.", " phil",
+                   " philippines", " phils.", " phils"]:
+        text = text.replace(suffix, "")
+    return text.strip()
 
-    email_lower = sender_email.lower().strip()
-    clients = _load_sheet()
 
+def identify_client(sender_email: str, subject: str = "",
+                    description: str = "") -> dict | None:
+    """
+    Match a ticket to a client record using 4 strategies (in priority order):
+      1. Exact email match
+      2. Email domain match
+      3. Company name found in subject line
+      4. Company name found in email body/description
+    """
+    email_lower = (sender_email or "").lower().strip()
+    clients     = _load_sheet()
+
+    # ── Strategy 1: Exact email match ────────────────────────────────────────
     for c in clients:
         if email_lower in [e.lower() for e in c["emails"]]:
-            return {**c, "match_type": "exact"}
+            log.info("Matched by exact email: %s → %s", sender_email, c["company"])
+            return {**c, "match_type": "exact_email"}
 
-    domain = email_lower.split("@")[-1] if "@" in email_lower else ""
+    # ── Strategy 2: Email domain match ───────────────────────────────────────
+    domain  = email_lower.split("@")[-1] if "@" in email_lower else ""
     generic = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
-               "icloud.com", "live.com", "ymail.com"}
+               "icloud.com", "live.com", "ymail.com", "sprout.ph",
+               "netsuite.com", "email.netsuite.com"}
     if domain and domain not in generic:
         for c in clients:
             if any(domain in e.lower() for e in c["emails"]):
+                log.info("Matched by domain: %s → %s", domain, c["company"])
                 return {**c, "match_type": "domain"}
 
+    # ── Strategy 3 & 4: Company name in subject or description ───────────────
+    search_texts = []
+    if subject:
+        search_texts.append(("subject", subject))
+    if description:
+        # Only search first 2000 chars of description for performance
+        search_texts.append(("description", description[:2000]))
+
+    for c in clients:
+        # Build list of all name variants for this client
+        all_names = [c["company"]] + c.get("alt_names", [])
+        norm_names = [_normalize(n) for n in all_names if n]
+
+        for source, text in search_texts:
+            text_norm = _normalize(text)
+            for norm_name in norm_names:
+                # Must be at least 4 chars to avoid false positives
+                if len(norm_name) >= 4 and norm_name in text_norm:
+                    log.info("Matched by company name in %s: '%s' → %s",
+                             source, norm_name, c["company"])
+                    return {**c, "match_type": f"company_name_in_{source}"}
+
+    log.info("No client match found for email='%s'", sender_email)
     return None
 
 
@@ -205,7 +266,8 @@ def get_agent_initials(pic_name: str) -> str:
         return DEFAULT_INITIALS
     initials = AGENT_INITIALS.get(pic_name.lower().strip())
     if not initials:
-        log.warning("No initials for PIC '%s', using default '%s'", pic_name, DEFAULT_INITIALS)
+        log.warning("No initials for PIC '%s', using default '%s'",
+                    pic_name, DEFAULT_INITIALS)
         return DEFAULT_INITIALS
     return initials
 
@@ -214,7 +276,8 @@ def get_agent_initials(pic_name: str) -> str:
 # 2. AI ROUTING  (Claude)
 # ════════════════════════════════════════════════════════════════════════════
 
-def route_ticket(subject: str, description: str, sender_email: str, client) -> dict:
+def route_ticket(subject: str, description: str, sender_email: str,
+                 client: dict | None) -> dict:
     if client:
         client_ctx = (
             f"IDENTIFIED CLIENT: {client['company']}\n"
@@ -222,7 +285,10 @@ def route_ticket(subject: str, description: str, sender_email: str, client) -> d
             f"Match type: {client['match_type']}"
         )
     else:
-        client_ctx = f"CLIENT: Unknown - '{sender_email}' not in database. Route by content only."
+        client_ctx = (
+            f"CLIENT: Unknown - '{sender_email}' not in database.\n"
+            "Route by ticket content only."
+        )
 
     scenario_list = "\n".join(
         f"{s['id']} | {s['queue']} | {s['label']}" for s in SCENARIOS
@@ -243,13 +309,14 @@ SCENARIOS (id | queue | label):
 
 Philippine billing context:
 - 2307 = BIR Certificate of Creditable Tax Withheld (proof-of-payment doc clients submit)
-- 2303 = BIR Certificate of Registration (Sprout's own doc, clients request it)
+- 2303 = BIR Certificate of Registration (Sprout doc clients request)
 - OR = Official Receipt, CR = Collection Receipt
 - Recon = Reconciliation, SOA = Statement of Account
 - P1 = higher priority than P2
+- Requests to update invoice recipients / billing contacts = p2_bil_request
 
 Respond ONLY with valid JSON (no markdown):
-{{"scenario_id":"<one of the ids above>","scenario_queue":"<queue>","label":"<label>","confidence":<1-100>,"urgency":"<low|medium|high>","key_signals":["<s1>","<s2>","<s3>"],"reasoning":"<2 sentences>"}}"""
+{{"scenario_id":"<id>","scenario_queue":"<queue>","label":"<label>","confidence":<1-100>,"urgency":"<low|medium|high>","key_signals":["<s1>","<s2>","<s3>"],"reasoning":"<2 sentences>"}}"""
 
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514",
@@ -257,14 +324,16 @@ Respond ONLY with valid JSON (no markdown):
         messages=[{"role": "user", "content": prompt}],
     )
 
-    text = re.sub(r"```json|```", "", response.content[0].text.strip()).strip()
+    text   = re.sub(r"```json|```", "", response.content[0].text.strip()).strip()
     result = json.loads(text)
 
     valid_ids = {s["id"] for s in SCENARIOS}
     if result.get("scenario_id") not in valid_ids:
-        result.update({"scenario_id": SCENARIOS[0]["id"],
-                       "scenario_queue": SCENARIOS[0]["queue"],
-                       "label": SCENARIOS[0]["label"]})
+        result.update({
+            "scenario_id":    SCENARIOS[0]["id"],
+            "scenario_queue": SCENARIOS[0]["queue"],
+            "label":          SCENARIOS[0]["label"],
+        })
     return result
 
 
@@ -282,22 +351,24 @@ def _fd_url(path: str) -> str:
     return f"{domain}/api/v2{path}"
 
 
-def assign_ticket(ticket_id: str, routing: dict, client) -> dict:
-    pic_name  = client.get("pic", "") if client else ""
-    initials  = get_agent_initials(pic_name)
+def assign_ticket(ticket_id: str, routing: dict, client: dict | None) -> dict:
+    pic_name   = client.get("pic", "") if client else ""
+    initials   = get_agent_initials(pic_name)
     scene_type = routing.get("scenario_id", "p1_bil_dispute")
-    scene_id   = SCENARIO_MAP.get(scene_type, {}).get(initials) \
-                 or SCENARIO_MAP.get(scene_type, {}).get(DEFAULT_INITIALS)
+    scene_id   = (SCENARIO_MAP.get(scene_type, {}).get(initials)
+                  or SCENARIO_MAP.get(scene_type, {}).get(DEFAULT_INITIALS))
 
     if not scene_id:
-        log.error("No scenario ID for type='%s' initials='%s'", scene_type, initials)
+        log.error("No scenario ID for type='%s' initials='%s'",
+                  scene_type, initials)
         return {"status": "error", "reason": "scenario_id not found"}
 
     log.info("Triggering scenario %s (%s + %s) on ticket #%s",
              scene_id, scene_type, initials, ticket_id)
 
     url = _fd_url(f"/tickets/{ticket_id}/trigger_scenario")
-    r   = requests.post(url, json={"scenario_id": scene_id},
+    r   = requests.post(url,
+                        json={"scenario_id": scene_id},
                         auth=_fd_auth(),
                         headers={"Content-Type": "application/json"},
                         timeout=10)
