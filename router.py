@@ -28,11 +28,11 @@ GOOGLE_CREDS_JSON   = os.environ["GOOGLE_CREDS_JSON"]    # full service account 
 # ── Freshdesk group name → group ID mapping ──────────────────────────────────
 # Fill these in after running: python tools/list_fd_groups.py
 FRESHDESK_GROUPS = {
-    "P1_BILLINGS":      None,   # ← replace None with the actual integer ID
-    "P1_Collection":    None,
-    "P2_Billings":      None,
-    "P2_Collection":    None,
-    "P2_Other request": None,
+    "P1_BILLINGS":      70000335500,
+    "P1_Collection":    70000360397,
+    "P2_Billings":      70000335500,
+    "P2_Collection":    70000360397,
+    "P2_Other request": 70000335500,
 }
 
 # ── Scenario definitions (must match your Freshdesk setup) ───────────────────
