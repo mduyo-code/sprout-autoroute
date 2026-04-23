@@ -2,7 +2,7 @@
 router.py — Core logic for Sprout AutoRoute
   1. identify_client  — matches sender email → client record from Google Sheets
   2. route_ticket     — calls Claude API to pick the best Freshdesk scenario
-  3. assign_ticket    — updates the Freshdesk ticket (agent, group, tags)
+  3. assign_ticket    — triggers the exact Freshdesk Scenario Automation
 """
 
 import os
@@ -13,41 +13,118 @@ import gspread
 import requests
 from anthropic import Anthropic
 from google.oauth2.service_account import Credentials
-from functools import lru_cache
 from datetime import datetime, timedelta
 
 log = logging.getLogger(__name__)
 
-# ── Environment variables (set these in Render dashboard) ────────────────────
-ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
-FRESHDESK_DOMAIN    = os.environ["FRESHDESK_DOMAIN"]     # e.g. yourcompany.freshdesk.com
-FRESHDESK_API_KEY   = os.environ["FRESHDESK_API_KEY"]
-GOOGLE_SHEET_ID     = os.environ["GOOGLE_SHEET_ID"]      # the long ID from the Sheet URL
-GOOGLE_CREDS_JSON   = os.environ["GOOGLE_CREDS_JSON"]    # full service account JSON as a string
+# ── Environment variables ─────────────────────────────────────────────────────
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+FRESHDESK_DOMAIN  = os.environ["FRESHDESK_DOMAIN"]
+FRESHDESK_API_KEY = os.environ["FRESHDESK_API_KEY"]
+GOOGLE_SHEET_ID   = os.environ["GOOGLE_SHEET_ID"]
+GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 
-# ── Freshdesk group name → group ID mapping ──────────────────────────────────
-# Fill these in after running: python tools/list_fd_groups.py
-FRESHDESK_GROUPS = {
-    "P1_BILLINGS":      70000335500,
-    "P1_Collection":    70000360397,
-    "P2_Billings":      70000335500,
-    "P2_Collection":    70000360397,
-    "P2_Other request": 70000335500,
+anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ── Freshdesk Scenario Automation IDs ────────────────────────────────────────
+# Format: SCENARIO_MAP[scenario_type][agent_initials] = scenario_id
+# AC=Abegail Cruz, AG=Andrea Gaor, BP=Bea Punzalan,
+# JL=John Paulo Ligad, KC=Katrina Blanca Catalan,
+# MD=Mabel Duyo, YN=Ynna Navarra
+
+SCENARIO_MAP = {
+    "p1_bil_dispute": {
+        "AC": 70000512289,
+        "AG": 70000516799,
+        "BP": 70000518088,
+        "JL": 70000516820,
+        "KC": 70000518089,
+        "MD": 70000482143,
+        "YN": 70000519482,
+    },
+    "p1_bil_revision": {
+        "AC": 70000516821,
+        "AG": 70000516798,
+        "BP": 70000516822,
+        "JL": 70000518090,
+        "KC": 70000518091,
+        "MD": 70000516823,
+        "YN": 70000519483,
+    },
+    "p1_col_posting": {
+        "AC": 70000516825,
+        "AG": 70000513826,
+        "BP": 70000516826,
+        "JL": 70000518092,
+        "KC": 70000518093,
+        "MD": 70000516827,
+        "YN": 70000519484,
+    },
+    "p2_bil_renewal": {
+        "AC": 70000516829,
+        "AG": 70000516802,
+        "BP": 70000516830,
+        "JL": 70000518095,
+        "KC": 70000518096,
+        "MD": 70000516833,
+        "YN": 70000519485,
+    },
+    "p2_bil_request": {
+        "AC": 70000516834,
+        "AG": 70000516801,
+        "BP": 70000516835,
+        "JL": 70000518097,
+        "KC": 70000518098,
+        "MD": 70000516836,
+        "YN": 70000519486,
+    },
+    "p2_col_cr_or": {
+        "AC": 70000516838,
+        "AG": 70000516800,
+        "BP": 70000516839,
+        "JL": 70000518099,
+        "KC": 70000518100,
+        "MD": 70000516840,
+        "YN": 70000519487,
+    },
+    "p2_other_2303": {
+        "AC": 70000516842,
+        "AG": 70000516803,
+        "BP": 70000516843,
+        "JL": 70000518101,
+        "KC": 70000518102,
+        "MD": 70000516844,
+        "YN": 70000519488,
+    },
 }
 
-# ── Scenario definitions (must match your Freshdesk setup) ───────────────────
+DEFAULT_INITIALS = "MD"
+
+# ── Scenario definitions for Claude prompt ────────────────────────────────────
 SCENARIOS = [
     {"id": "p1_bil_dispute",  "queue": "P1_BILLINGS",      "label": "Invoice Disputes, Client Request, Recon"},
     {"id": "p1_bil_revision", "queue": "P1_BILLINGS",      "label": "Invoice Revision"},
     {"id": "p1_col_posting",  "queue": "P1_Collection",    "label": "Posting Proof of Payment & BIR 2307"},
     {"id": "p2_bil_renewal",  "queue": "P2_Billings",      "label": "Billing of Renewal and New Client"},
-    {"id": "p2_bil_request",  "queue": "P2_Billings",      "label": "Request Invoice"},
+    {"id": "p2_bil_request",  "queue": "P2_Billings",      "label": "Request Invoice (soft & hard copy)"},
     {"id": "p2_col_cr_or",    "queue": "P2_Collection",    "label": "Request for CR, OR, Payment Extension, Recon"},
     {"id": "p2_other_2303",   "queue": "P2_Other request", "label": "Request for 2303 & Other Sprout Docs"},
 ]
 
-anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
-
+# ── Agent name → initials mapping ────────────────────────────────────────────
+AGENT_INITIALS = {
+    "abegail cruz":           "AC",
+    "andrea gaor":            "AG",
+    "bea punzalan":           "BP",
+    "john paulo ligad":       "JL",
+    "john ligad":             "JL",
+    "katrina blanca catalan": "KC",
+    "katrina catalan":        "KC",
+    "mabel duyo":             "MD",
+    "ynna navarra":           "YN",
+    "jessica orinday":        "JO",
+    "angeline flores":        "AF",
+}
 
 # ════════════════════════════════════════════════════════════════════════════
 # 1. CLIENT IDENTIFICATION  (Google Sheets)
@@ -56,14 +133,14 @@ anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
 _sheet_cache: dict = {}
 _sheet_cache_expiry: datetime = datetime.min
 
-def _load_sheet() -> list[dict]:
-    """Load and cache client records from Google Sheets (refreshes every 10 min)."""
+
+def _load_sheet() -> list:
     global _sheet_cache, _sheet_cache_expiry
 
     if datetime.now() < _sheet_cache_expiry and _sheet_cache:
         return list(_sheet_cache.values())
 
-    log.info("Refreshing Google Sheets client cache…")
+    log.info("Refreshing Google Sheets client cache...")
     creds_info = json.loads(GOOGLE_CREDS_JSON)
     scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
@@ -71,29 +148,28 @@ def _load_sheet() -> list[dict]:
     ws = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
     all_rows = ws.get_all_values()
 
-    # Column indices (0-based):
-    # O=14, V=21, W=22, X=23, Y=24, Z=25, AA=26, AH=33
-    EMAIL_COLS = [14, 21, 22, 23, 24, 25, 26]
-    PIC_COL    = 33
-    NAME_COL   = 0   # Column A — adjust if company name is elsewhere
+    EMAIL_COLS = [14, 21, 22, 23, 24, 25, 26]  # O, V, W, X, Y, Z, AA
+    PIC_COL    = 33   # AH
+    NAME_COL   = 0    # A
 
-    clients: dict[str, dict] = {}  # keyed by company name for dedup
+    clients: dict = {}
 
-    for row in all_rows[1:]:  # skip header
+    for row in all_rows[1:]:
         def get(idx):
             return row[idx].strip() if idx < len(row) else ""
 
         company = get(NAME_COL)
         pic     = get(PIC_COL)
         if not pic:
-            continue  # skip rows without a Finance PIC
+            continue
 
         emails = [get(i) for i in EMAIL_COLS if get(i)]
+        if not emails:
+            continue
 
         if company not in clients:
             clients[company] = {"company": company, "pic": pic, "emails": []}
         clients[company]["emails"].extend(emails)
-        # Deduplicate emails
         clients[company]["emails"] = list(dict.fromkeys(clients[company]["emails"]))
 
     _sheet_cache = clients
@@ -102,24 +178,17 @@ def _load_sheet() -> list[dict]:
     return list(clients.values())
 
 
-def identify_client(sender_email: str) -> dict | None:
-    """
-    Match sender_email to a client record.
-    Priority: 1) exact email match  2) email domain match
-    Returns client dict or None if unknown.
-    """
+def identify_client(sender_email: str):
     if not sender_email:
         return None
 
     email_lower = sender_email.lower().strip()
     clients = _load_sheet()
 
-    # 1. Exact match
     for c in clients:
         if email_lower in [e.lower() for e in c["emails"]]:
             return {**c, "match_type": "exact"}
 
-    # 2. Domain match (skip generic domains)
     domain = email_lower.split("@")[-1] if "@" in email_lower else ""
     generic = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
                "icloud.com", "live.com", "ymail.com"}
@@ -131,28 +200,29 @@ def identify_client(sender_email: str) -> dict | None:
     return None
 
 
+def get_agent_initials(pic_name: str) -> str:
+    if not pic_name:
+        return DEFAULT_INITIALS
+    initials = AGENT_INITIALS.get(pic_name.lower().strip())
+    if not initials:
+        log.warning("No initials for PIC '%s', using default '%s'", pic_name, DEFAULT_INITIALS)
+        return DEFAULT_INITIALS
+    return initials
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 2. AI ROUTING  (Claude)
 # ════════════════════════════════════════════════════════════════════════════
 
-def route_ticket(subject: str, description: str, sender_email: str,
-                 client: dict | None) -> dict:
-    """
-    Ask Claude to pick the correct Freshdesk scenario queue.
-    Returns a dict with scenario_id, scenario_queue, label, confidence,
-    urgency, key_signals, reasoning.
-    """
+def route_ticket(subject: str, description: str, sender_email: str, client) -> dict:
     if client:
         client_ctx = (
             f"IDENTIFIED CLIENT: {client['company']}\n"
-            f"FINANCE PIC (Agent to assign): {client['pic']}\n"
+            f"FINANCE PIC: {client['pic']}\n"
             f"Match type: {client['match_type']}"
         )
     else:
-        client_ctx = (
-            f"CLIENT: Unknown — email '{sender_email}' not in database.\n"
-            "Route by ticket content only."
-        )
+        client_ctx = f"CLIENT: Unknown - '{sender_email}' not in database. Route by content only."
 
     scenario_list = "\n".join(
         f"{s['id']} | {s['queue']} | {s['label']}" for s in SCENARIOS
@@ -165,8 +235,8 @@ Route this ticket to the correct scenario queue.
 
 TICKET:
 Subject: {subject}
-Description: {description[:1500]}
-Sender email: {sender_email}
+Description (first 1500 chars): {description[:1500]}
+Sender: {sender_email}
 
 SCENARIOS (id | queue | label):
 {scenario_list}
@@ -178,16 +248,8 @@ Philippine billing context:
 - Recon = Reconciliation, SOA = Statement of Account
 - P1 = higher priority than P2
 
-Respond ONLY with valid JSON (no markdown, no extra text):
-{{
-  "scenario_id": "<one of the ids above>",
-  "scenario_queue": "<matching queue name>",
-  "label": "<matching label>",
-  "confidence": <1-100>,
-  "urgency": "<low|medium|high>",
-  "key_signals": ["<signal1>", "<signal2>", "<signal3>"],
-  "reasoning": "<2 concise sentences>"
-}}"""
+Respond ONLY with valid JSON (no markdown):
+{{"scenario_id":"<one of the ids above>","scenario_queue":"<queue>","label":"<label>","confidence":<1-100>,"urgency":"<low|medium|high>","key_signals":["<s1>","<s2>","<s3>"],"reasoning":"<2 sentences>"}}"""
 
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514",
@@ -195,30 +257,22 @@ Respond ONLY with valid JSON (no markdown, no extra text):
         messages=[{"role": "user", "content": prompt}],
     )
 
-    text = response.content[0].text.strip()
-    # Strip markdown fences if present
-    text = re.sub(r"```json|```", "", text).strip()
+    text = re.sub(r"```json|```", "", response.content[0].text.strip()).strip()
     result = json.loads(text)
 
-    # Validate scenario_id
     valid_ids = {s["id"] for s in SCENARIOS}
     if result.get("scenario_id") not in valid_ids:
-        # fallback to first scenario
-        result["scenario_id"]    = SCENARIOS[0]["id"]
-        result["scenario_queue"] = SCENARIOS[0]["queue"]
-        result["label"]          = SCENARIOS[0]["label"]
-
+        result.update({"scenario_id": SCENARIOS[0]["id"],
+                       "scenario_queue": SCENARIOS[0]["queue"],
+                       "label": SCENARIOS[0]["label"]})
     return result
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 3. FRESHDESK ASSIGNMENT
+# 3. FRESHDESK SCENARIO TRIGGER
 # ════════════════════════════════════════════════════════════════════════════
 
-def _fd_headers() -> dict:
-    return {"Content-Type": "application/json"}
-
-def _fd_auth() -> tuple:
+def _fd_auth():
     return (FRESHDESK_API_KEY, "X")
 
 def _fd_url(path: str) -> str:
@@ -228,65 +282,30 @@ def _fd_url(path: str) -> str:
     return f"{domain}/api/v2{path}"
 
 
-@lru_cache(maxsize=1)
-def _get_agents() -> dict:
-    """Fetch all Freshdesk agents and return {name_lower: agent_id}."""
-    r = requests.get(_fd_url("/agents"), auth=_fd_auth(), timeout=10)
-    r.raise_for_status()
-    return {a["contact"]["name"].lower(): a["id"] for a in r.json()}
+def assign_ticket(ticket_id: str, routing: dict, client) -> dict:
+    pic_name  = client.get("pic", "") if client else ""
+    initials  = get_agent_initials(pic_name)
+    scene_type = routing.get("scenario_id", "p1_bil_dispute")
+    scene_id   = SCENARIO_MAP.get(scene_type, {}).get(initials) \
+                 or SCENARIO_MAP.get(scene_type, {}).get(DEFAULT_INITIALS)
 
+    if not scene_id:
+        log.error("No scenario ID for type='%s' initials='%s'", scene_type, initials)
+        return {"status": "error", "reason": "scenario_id not found"}
 
-def _find_agent_id(name: str) -> int | None:
-    """Look up a Freshdesk agent ID by name (case-insensitive)."""
-    if not name:
-        return None
-    agents = _get_agents()
-    return agents.get(name.lower())
+    log.info("Triggering scenario %s (%s + %s) on ticket #%s",
+             scene_id, scene_type, initials, ticket_id)
 
-
-def assign_ticket(ticket_id: str, routing: dict, client: dict | None) -> dict:
-    """
-    Update the Freshdesk ticket:
-      - Assign to the Finance PIC agent (if identified)
-      - Set the group matching the scenario queue
-      - Add routing tags
-    """
-    update_body: dict = {}
-
-    # Assign agent
-    if client and client.get("pic"):
-        agent_id = _find_agent_id(client["pic"])
-        if agent_id:
-            update_body["responder_id"] = agent_id
-        else:
-            log.warning("Agent '%s' not found in Freshdesk", client["pic"])
-
-    # Assign group
-    queue = routing.get("scenario_queue", "")
-    group_id = FRESHDESK_GROUPS.get(queue)
-    if group_id:
-        update_body["group_id"] = group_id
-    else:
-        log.warning("Group ID not configured for queue '%s'", queue)
-
-    # Add tags
-    tags = [
-        routing.get("scenario_id", ""),
-        f"urgency_{routing.get('urgency', 'medium')}",
-        "auto-routed",
-    ]
-    update_body["tags"] = [t for t in tags if t]
-
-    if not update_body:
-        return {"status": "skipped", "reason": "nothing to update"}
-
-    url = _fd_url(f"/tickets/{ticket_id}")
-    r = requests.put(url, json=update_body, auth=_fd_auth(),
-                     headers=_fd_headers(), timeout=10)
+    url = _fd_url(f"/tickets/{ticket_id}/trigger_scenario")
+    r   = requests.post(url, json={"scenario_id": scene_id},
+                        auth=_fd_auth(),
+                        headers={"Content-Type": "application/json"},
+                        timeout=10)
 
     if r.status_code in (200, 204):
-        log.info("Ticket #%s updated successfully", ticket_id)
-        return {"status": "ok", "updated": update_body}
+        log.info("Scenario triggered successfully on ticket #%s", ticket_id)
+        return {"status": "ok", "scenario_id": scene_id,
+                "initials": initials, "pic": pic_name, "type": scene_type}
     else:
-        log.error("Freshdesk update failed %s: %s", r.status_code, r.text)
+        log.error("Scenario trigger failed %s: %s", r.status_code, r.text)
         return {"status": "error", "code": r.status_code, "body": r.text}
